@@ -21,6 +21,13 @@ if ($data.hook) { $payload["hook"] = $data.hook }
 if ($data.session_id) {
     $payload["session"] = $data.session_id.Substring(0, [Math]::Min(16, $data.session_id.Length))
 }
+
+# Estimate token usage from transcript file size (~4 bytes per token)
+if ($data.transcript_path -and (Test-Path $data.transcript_path)) {
+    $fileSize = (Get-Item $data.transcript_path).Length
+    $payload["tokens"] = [int]($fileSize / 4)
+}
+
 if ($payload.Count -eq 0) { exit 0 }
 
 $json_out = $payload | ConvertTo-Json -Compress

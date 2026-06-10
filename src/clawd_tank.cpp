@@ -94,7 +94,9 @@ int eventCount = 0;
 char sessionId[20] = "";
 unsigned long sessionStartMs = 0;
 int sessionEvents = 0;
-#define SESSION_WINDOW_SEC 18000  // 5 hours (Pro plan reset window)
+unsigned long sessionTokens = 0;
+#define SESSION_WINDOW_SEC 18000   // 5 hours (Pro plan reset window)
+#define PLAN_TOKEN_LIMIT   800000  // ~800k tokens per window (Pro estimate)
 
 // --- Battery keepalive ---
 unsigned long lastKeepalive = 0;
@@ -468,30 +470,36 @@ void drawActivityRing(float ph) {
 // ============================================================
 
 void drawUsageRing() {
-    if (sessionStartMs == 0) return;
+    if (sessionTokens == 0 && sessionStartMs == 0) return;
 
-    unsigned long elapsedSec = (millis() - sessionStartMs) / 1000;
-    float fillRatio = (float)elapsedSec / SESSION_WINDOW_SEC;
+    float fillRatio = (float)sessionTokens / PLAN_TOKEN_LIMIT;
     if (fillRatio > 1.0f) fillRatio = 1.0f;
 
-    // Color shifts as usage increases
     uint16_t ringColor;
-    if (fillRatio < 0.5f) ringColor = C_ACCENT;      // blue: plenty left
-    else if (fillRatio < 0.75f) ringColor = C_GOOD;   // green: halfway
-    else if (fillRatio < 0.9f) ringColor = C_WARN;    // orange: getting close
-    else ringColor = C_ERR;                            // red: almost done
+    if (fillRatio < 0.5f) ringColor = C_ACCENT;
+    else if (fillRatio < 0.75f) ringColor = C_GOOD;
+    else if (fillRatio < 0.9f) ringColor = C_WARN;
+    else ringColor = C_ERR;
 
-    float startAngle = -1.5708f; // top (- PI/2)
+    float startAngle = -1.5708f;
     float endAngle = startAngle + fillRatio * 6.2832f;
     int radius = 100;
 
+    // Background ring (dim track)
+    for (float a = startAngle; a < startAngle + 6.2832f; a += 0.05f) {
+        int x = CX + (int)(radius * cosf(a));
+        int y = CY + (int)(radius * sinf(a));
+        canvas.drawPixel(x, y, C_INACTIVE);
+    }
+
+    // Filled arc
     for (float a = startAngle; a < endAngle; a += 0.03f) {
         int x = CX + (int)(radius * cosf(a));
         int y = CY + (int)(radius * sinf(a));
         canvas.fillRect(x - 1, y - 1, 3, 3, ringColor);
     }
 
-    // Tick marks at 25% (1h15m intervals)
+    // Tick marks at 25%
     for (int i = 0; i < 4; i++) {
         float a = startAngle + i * 1.5708f;
         int x1 = CX + (int)(96 * cosf(a));
@@ -509,7 +517,7 @@ void drawUsageRing() {
 void drawStatus() {
     uint16_t actColor = activityColors[currentActivity];
 
-    // Countdown timer at top center
+    // Top: countdown timer + token usage
     if (sessionStartMs > 0) {
         unsigned long elapsedSec = (millis() - sessionStartMs) / 1000;
         long remainSec = SESSION_WINDOW_SEC - (long)elapsedSec;
@@ -519,21 +527,27 @@ void drawStatus() {
         int m = (remainSec % 3600) / 60;
         int s = remainSec % 60;
 
+        // Countdown H:MM:SS
         char timeBuf[16];
         snprintf(timeBuf, sizeof(timeBuf), "%d:%02d:%02d", h, m, s);
-
         canvas.setTextDatum(TC_DATUM);
         uint16_t timeColor = (remainSec < 600) ? C_ERR : (remainSec < 1800) ? C_WARN : C_LABEL;
         canvas.setTextColor(timeColor, C_BG);
         canvas.setTextFont(2);
         canvas.drawString(timeBuf, CX, 15);
 
-        // Session event count below timer
-        char evBuf[16];
-        snprintf(evBuf, sizeof(evBuf), "%d evts", sessionEvents);
+        // Token usage below (e.g. "123.4k / 800k")
+        char tokBuf[24];
+        if (sessionTokens >= 1000) {
+            snprintf(tokBuf, sizeof(tokBuf), "%.1fk / %dk",
+                sessionTokens / 1000.0f, PLAN_TOKEN_LIMIT / 1000);
+        } else {
+            snprintf(tokBuf, sizeof(tokBuf), "%lu / %dk",
+                sessionTokens, PLAN_TOKEN_LIMIT / 1000);
+        }
         canvas.setTextFont(1);
         canvas.setTextColor(C_INACTIVE, C_BG);
-        canvas.drawString(evBuf, CX, 32);
+        canvas.drawString(tokBuf, CX, 32);
     }
 
     // Activity name at bottom
@@ -602,8 +616,13 @@ void processJson(const char* json) {
         strlcpy(sessionId, sess, sizeof(sessionId));
         sessionStartMs = millis();
         sessionEvents = 0;
+        sessionTokens = 0;
     }
     sessionEvents++;
+
+    // Update token count from hook
+    unsigned long tokens = doc["tokens"] | 0UL;
+    if (tokens > 0) sessionTokens = tokens;
 
     const char* tool = doc["tool"] | (const char*)nullptr;
     const char* activity = doc["activity"] | (const char*)nullptr;
@@ -676,8 +695,8 @@ void handleStatus() {
     }
     char buf[256];
     snprintf(buf, sizeof(buf),
-        "{\"activity\":\"%s\",\"events\":%d,\"session_events\":%d,\"remain\":%ld,\"uptime\":%lu}",
-        activityNames[currentActivity], eventCount, sessionEvents, remainSec, millis() / 1000);
+        "{\"activity\":\"%s\",\"events\":%d,\"tokens\":%lu,\"remain\":%ld,\"uptime\":%lu}",
+        activityNames[currentActivity], eventCount, sessionTokens, remainSec, millis() / 1000);
     server.send(200, "application/json", buf);
 }
 
