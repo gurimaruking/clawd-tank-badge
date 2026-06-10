@@ -87,6 +87,7 @@ void initColors() {
 // --- State ---
 Activity currentActivity = ACT_IDLE;
 unsigned long lastEventTime = 0;
+unsigned long bootMs = 0;
 char lastTool[24] = "";
 int eventCount = 0;
 
@@ -517,9 +518,10 @@ void drawUsageRing() {
 void drawStatus() {
     uint16_t actColor = activityColors[currentActivity];
 
-    // Top: countdown timer + token usage
-    if (sessionStartMs > 0) {
-        unsigned long elapsedSec = (millis() - sessionStartMs) / 1000;
+    // Top: countdown timer (always visible)
+    {
+        unsigned long startMs = (sessionStartMs > 0) ? sessionStartMs : bootMs;
+        unsigned long elapsedSec = (millis() - startMs) / 1000;
         long remainSec = SESSION_WINDOW_SEC - (long)elapsedSec;
         if (remainSec < 0) remainSec = 0;
 
@@ -527,7 +529,6 @@ void drawStatus() {
         int m = (remainSec % 3600) / 60;
         int s = remainSec % 60;
 
-        // Countdown H:MM:SS
         char timeBuf[16];
         snprintf(timeBuf, sizeof(timeBuf), "%d:%02d:%02d", h, m, s);
         canvas.setTextDatum(TC_DATUM);
@@ -535,19 +536,6 @@ void drawStatus() {
         canvas.setTextColor(timeColor, C_BG);
         canvas.setTextFont(2);
         canvas.drawString(timeBuf, CX, 15);
-
-        // Token usage below (e.g. "123.4k / 800k")
-        char tokBuf[24];
-        if (sessionTokens >= 1000) {
-            snprintf(tokBuf, sizeof(tokBuf), "%.1fk / %dk",
-                sessionTokens / 1000.0f, PLAN_TOKEN_LIMIT / 1000);
-        } else {
-            snprintf(tokBuf, sizeof(tokBuf), "%lu / %dk",
-                sessionTokens, PLAN_TOKEN_LIMIT / 1000);
-        }
-        canvas.setTextFont(1);
-        canvas.setTextColor(C_INACTIVE, C_BG);
-        canvas.drawString(tokBuf, CX, 32);
     }
 
     // Activity name at bottom
@@ -748,6 +736,7 @@ void setupWiFi() {
 void setup() {
     Serial.begin(115200);
     delay(300);
+    bootMs = millis();
 
     tft.init();
     tft.setRotation(0);
