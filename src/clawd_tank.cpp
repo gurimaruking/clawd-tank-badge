@@ -471,7 +471,6 @@ void drawActivityRing(float ph) {
 // ============================================================
 
 void drawUsageRing() {
-    if (sessionTokens == 0 && sessionStartMs == 0) return;
 
     float fillRatio = (float)sessionTokens / PLAN_TOKEN_LIMIT;
     if (fillRatio > 1.0f) fillRatio = 1.0f;
@@ -535,7 +534,7 @@ void drawStatus() {
         uint16_t timeColor = (remainSec < 600) ? C_ERR : (remainSec < 1800) ? C_WARN : C_LABEL;
         canvas.setTextColor(timeColor, C_BG);
         canvas.setTextFont(2);
-        canvas.drawString(timeBuf, CX, 15);
+        canvas.drawString(timeBuf, CX, 40);
     }
 
     // Activity name at bottom
