@@ -454,8 +454,8 @@ void drawActivityRing(float ph) {
 
     for (int i = 0; i < numDots; i++) {
         float a = ph * speed + i * arcSpacing;
-        int x = CX + (int)(113 * cosf(a));
-        int y = CY + (int)(113 * sinf(a));
+        int x = CX + (int)(116 * cosf(a));
+        int y = CY + (int)(116 * sinf(a));
         // Fade based on position
         bool bright = (i % 3 == 0);
         if (bright) {
@@ -471,7 +471,6 @@ void drawActivityRing(float ph) {
 // ============================================================
 
 void drawUsageRing() {
-
     float fillRatio = (float)sessionTokens / PLAN_TOKEN_LIMIT;
     if (fillRatio > 1.0f) fillRatio = 1.0f;
 
@@ -483,30 +482,32 @@ void drawUsageRing() {
 
     float startAngle = -1.5708f;
     float endAngle = startAngle + fillRatio * 6.2832f;
-    int radius = 100;
+    int radius = 108;
 
-    // Background ring (dim track)
-    for (float a = startAngle; a < startAngle + 6.2832f; a += 0.05f) {
+    // Background ring (thick dim track)
+    for (float a = startAngle; a < startAngle + 6.2832f; a += 0.02f) {
         int x = CX + (int)(radius * cosf(a));
         int y = CY + (int)(radius * sinf(a));
-        canvas.drawPixel(x, y, C_INACTIVE);
+        canvas.fillRect(x - 1, y - 1, 3, 3, C_INACTIVE);
     }
 
-    // Filled arc
-    for (float a = startAngle; a < endAngle; a += 0.03f) {
-        int x = CX + (int)(radius * cosf(a));
-        int y = CY + (int)(radius * sinf(a));
-        canvas.fillRect(x - 1, y - 1, 3, 3, ringColor);
+    // Filled arc (bright, thick)
+    if (fillRatio > 0.001f) {
+        for (float a = startAngle; a < endAngle; a += 0.015f) {
+            int x = CX + (int)(radius * cosf(a));
+            int y = CY + (int)(radius * sinf(a));
+            canvas.fillRect(x - 2, y - 2, 5, 5, ringColor);
+        }
     }
 
     // Tick marks at 25%
     for (int i = 0; i < 4; i++) {
         float a = startAngle + i * 1.5708f;
-        int x1 = CX + (int)(96 * cosf(a));
-        int y1 = CY + (int)(96 * sinf(a));
-        int x2 = CX + (int)(104 * cosf(a));
-        int y2 = CY + (int)(104 * sinf(a));
-        canvas.drawLine(x1, y1, x2, y2, C_INACTIVE);
+        for (int r = radius - 4; r <= radius + 4; r++) {
+            int x = CX + (int)(r * cosf(a));
+            int y = CY + (int)(r * sinf(a));
+            canvas.drawPixel(x, y, C_LABEL);
+        }
     }
 }
 
@@ -610,6 +611,13 @@ void processJson(const char* json) {
     // Update token count from hook
     unsigned long tokens = doc["tokens"] | 0UL;
     if (tokens > 0) sessionTokens = tokens;
+
+    // Timer offset correction (seconds already elapsed before first event)
+    long offset = doc["offset"] | 0L;
+    if (offset > 0 && sessionStartMs > 0) {
+        unsigned long adjusted = millis() - (unsigned long)(offset * 1000);
+        if (adjusted < sessionStartMs) sessionStartMs = adjusted;
+    }
 
     const char* tool = doc["tool"] | (const char*)nullptr;
     const char* activity = doc["activity"] | (const char*)nullptr;
