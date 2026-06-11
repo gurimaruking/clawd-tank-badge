@@ -4,6 +4,8 @@
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <WebServer.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 
 // ============================================================
 // Clawd Tank — Pixel Art Crab for ESP32-C3 + GC9A01 (240x240)
@@ -95,13 +97,21 @@ int eventCount = 0;
 char sessionId[20] = "";
 unsigned long sessionStartMs = 0;
 int sessionEvents = 0;
-unsigned long sessionTokens = 0;
+unsigned long sessionTokens = 0;       // tokens in current session (from transcript)
+unsigned long windowTokens = 0;        // accumulated tokens across all sessions in window
+unsigned long windowStartMs = 0;       // when the 5h window started
+unsigned long prevSessionTokens = 0;   // tokens from previous sessions in this window
 #define SESSION_WINDOW_SEC 18000   // 5 hours (Pro plan reset window)
 #define PLAN_TOKEN_LIMIT   800000  // ~800k tokens per window (Pro estimate)
 
 // --- Battery keepalive ---
 unsigned long lastKeepalive = 0;
 #define KEEPALIVE_INTERVAL 25000  // 25 seconds
+
+// --- Relay polling ---
+#define RELAY_URL "https://crab.robostadion.com/state"
+unsigned long lastPoll = 0;
+#define POLL_INTERVAL 3000  // 3 seconds
 
 // --- Animation ---
 float phase = 0;
@@ -471,7 +481,7 @@ void drawActivityRing(float ph) {
 // ============================================================
 
 void drawUsageRing() {
-    float fillRatio = (float)sessionTokens / PLAN_TOKEN_LIMIT;
+    float fillRatio = (float)windowTokens / PLAN_TOKEN_LIMIT;
     if (fillRatio > 1.0f) fillRatio = 1.0f;
 
     uint16_t ringColor;
@@ -518,9 +528,9 @@ void drawUsageRing() {
 void drawStatus() {
     uint16_t actColor = activityColors[currentActivity];
 
-    // Top: countdown timer (always visible)
+    // Top: countdown to plan window reset
     {
-        unsigned long startMs = (sessionStartMs > 0) ? sessionStartMs : bootMs;
+        unsigned long startMs = (windowStartMs > 0) ? windowStartMs : (sessionStartMs > 0) ? sessionStartMs : bootMs;
         unsigned long elapsedSec = (millis() - startMs) / 1000;
         long remainSec = SESSION_WINDOW_SEC - (long)elapsedSec;
         if (remainSec < 0) remainSec = 0;
@@ -598,25 +608,53 @@ void processJson(const char* json) {
     StaticJsonDocument<384> doc;
     if (deserializeJson(doc, json)) return;
 
+    // Check if 5h window expired — reset everything
+    if (windowStartMs > 0) {
+        unsigned long windowElapsed = (millis() - windowStartMs) / 1000;
+        if (windowElapsed >= SESSION_WINDOW_SEC) {
+            windowStartMs = 0;
+            windowTokens = 0;
+            prevSessionTokens = 0;
+            sessionTokens = 0;
+        }
+    }
+
     // Track session
     const char* sess = doc["session"] | (const char*)nullptr;
     if (sess && strcmp(sess, sessionId) != 0) {
+        // New session — save previous session's tokens to accumulator
+        prevSessionTokens += sessionTokens;
         strlcpy(sessionId, sess, sizeof(sessionId));
         sessionStartMs = millis();
         sessionEvents = 0;
         sessionTokens = 0;
+        // Start the window on first-ever session
+        if (windowStartMs == 0) windowStartMs = millis();
     }
     sessionEvents++;
 
-    // Update token count from hook
+    // Update token count from hook (this session's transcript-based estimate)
     unsigned long tokens = doc["tokens"] | 0UL;
     if (tokens > 0) sessionTokens = tokens;
 
+    // Accumulated total for usage ring
+    windowTokens = prevSessionTokens + sessionTokens;
+
+    // Direct calibration overrides from claude.ai/settings/usage
+    long planTokens = doc["plan_tokens"] | -1L;
+    if (planTokens >= 0) windowTokens = (unsigned long)planTokens;
+
+    long planReset = doc["plan_reset"] | -1L;
+    if (planReset >= 0) {
+        // Set windowStartMs so countdown = planReset seconds remaining
+        windowStartMs = millis() - (unsigned long)(SESSION_WINDOW_SEC - planReset) * 1000;
+    }
+
     // Timer offset correction (seconds already elapsed before first event)
     long offset = doc["offset"] | 0L;
-    if (offset > 0 && sessionStartMs > 0) {
+    if (offset > 0 && windowStartMs > 0) {
         unsigned long adjusted = millis() - (unsigned long)(offset * 1000);
-        if (adjusted < sessionStartMs) sessionStartMs = adjusted;
+        if (adjusted < windowStartMs) windowStartMs = adjusted;
     }
 
     const char* tool = doc["tool"] | (const char*)nullptr;
@@ -671,7 +709,14 @@ void readSerial() {
 //  WiFi & HTTP Server
 // ============================================================
 
+void sendCors() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
 void handleEvent() {
+    sendCors();
     if (server.hasArg("plain")) {
         String body = server.arg("plain");
         processJson(body.c_str());
@@ -681,17 +726,22 @@ void handleEvent() {
     }
 }
 
+void handleOptions() {
+    sendCors();
+    server.send(204);
+}
+
 void handleStatus() {
+    sendCors();
     long remainSec = 0;
-    if (sessionStartMs > 0) {
-        unsigned long elapsed = (millis() - sessionStartMs) / 1000;
-        remainSec = SESSION_WINDOW_SEC - (long)elapsed;
-        if (remainSec < 0) remainSec = 0;
-    }
+    unsigned long startMs = (windowStartMs > 0) ? windowStartMs : (sessionStartMs > 0) ? sessionStartMs : bootMs;
+    unsigned long elapsed = (millis() - startMs) / 1000;
+    remainSec = SESSION_WINDOW_SEC - (long)elapsed;
+    if (remainSec < 0) remainSec = 0;
     char buf[256];
     snprintf(buf, sizeof(buf),
         "{\"activity\":\"%s\",\"events\":%d,\"tokens\":%lu,\"remain\":%ld,\"uptime\":%lu}",
-        activityNames[currentActivity], eventCount, sessionTokens, remainSec, millis() / 1000);
+        activityNames[currentActivity], eventCount, windowTokens, remainSec, millis() / 1000);
     server.send(200, "application/json", buf);
 }
 
@@ -706,6 +756,7 @@ void handleRoot() {
 void startHttpServer() {
     server.on("/", handleRoot);
     server.on("/event", HTTP_POST, handleEvent);
+    server.on("/event", HTTP_OPTIONS, handleOptions);
     server.on("/status", HTTP_GET, handleStatus);
     server.begin();
     Serial.println("HTTP server started on port 80");
@@ -785,9 +836,28 @@ void setup() {
                    String(wifiConnected ? "true" : "false") + "}");
 }
 
+void pollRelay() {
+    if (!wifiConnected) return;
+    if (millis() - lastPoll < POLL_INTERVAL) return;
+    lastPoll = millis();
+
+    WiFiClientSecure client;
+    client.setInsecure();  // skip cert verification for speed
+    HTTPClient http;
+    http.setTimeout(2000);
+    if (!http.begin(client, RELAY_URL)) return;
+    int code = http.GET();
+    if (code == 200) {
+        String body = http.getString();
+        processJson(body.c_str());
+    }
+    http.end();
+}
+
 void loop() {
     readSerial();
     if (wifiConnected) server.handleClient();
+    pollRelay();
 
     // Auto-idle → sleep progression
     if (lastEventTime > 0 && currentActivity != ACT_DISCONNECTED) {
