@@ -1,9 +1,10 @@
-# Clawd Tank — Claude Code Hook Event Sender (HTTP)
-# Sends to both: local ESP32 (instant) + relay via tunnel (for remote polling)
+# Clawd Tank — Claude Code Hook Event Sender
+# Sends activity to the Pi relay (crab.robostadion.com).
+# The ESP32 badge polls the relay from anywhere — PC location doesn't matter.
+# Usage data comes from the Pi's own usage-sync service, never from here.
 
 param()
 
-$LOCAL_URL = "http://192.168.0.70/event"
 $RELAY_URL = "https://crab.robostadion.com/event"
 
 $input_json = $input | Out-String
@@ -22,22 +23,9 @@ if ($data.session_id) {
     $payload["session"] = $data.session_id.Substring(0, [Math]::Min(16, $data.session_id.Length))
 }
 
-# Estimate token usage from transcript file size (~4 bytes per token)
-if ($data.transcript_path -and (Test-Path $data.transcript_path)) {
-    $fileSize = (Get-Item $data.transcript_path).Length
-    $payload["tokens"] = [int]($fileSize / 4)
-}
-
 if ($payload.Count -eq 0) { exit 0 }
 
 $json_out = $payload | ConvertTo-Json -Compress
-
-# Always send to relay (works from anywhere)
 try {
     Invoke-RestMethod -Uri $RELAY_URL -Method Post -Body $json_out -ContentType "application/json" -TimeoutSec 3 | Out-Null
-} catch {}
-
-# Also try local ESP32 for instant reaction (same LAN only)
-try {
-    Invoke-RestMethod -Uri $LOCAL_URL -Method Post -Body $json_out -ContentType "application/json" -TimeoutSec 1 | Out-Null
 } catch {}

@@ -93,16 +93,16 @@ unsigned long bootMs = 0;
 char lastTool[24] = "";
 int eventCount = 0;
 
-// --- Session tracking ---
+// --- Plan usage (single source of truth: claude.ai via Pi sync) ---
 char sessionId[20] = "";
-unsigned long sessionStartMs = 0;
-int sessionEvents = 0;
-unsigned long sessionTokens = 0;       // tokens in current session (from transcript)
-unsigned long windowTokens = 0;        // accumulated tokens across all sessions in window
-unsigned long windowStartMs = 0;       // when the 5h window started
-unsigned long prevSessionTokens = 0;   // tokens from previous sessions in this window
-#define SESSION_WINDOW_SEC 18000   // 5 hours (Pro plan reset window)
-#define PLAN_TOKEN_LIMIT   800000  // ~800k tokens per window (Pro estimate)
+float usagePct = -1.0f;     // 0-100 from claude.ai utilization, -1 = unknown
+time_t planResetsAt = 0;    // absolute Unix epoch of 5h window reset, 0 = unknown
+
+bool clockValid() {
+    time_t now;
+    time(&now);
+    return now > 1700000000;
+}
 
 // --- Battery keepalive ---
 unsigned long lastKeepalive = 0;
@@ -481,7 +481,7 @@ void drawActivityRing(float ph) {
 // ============================================================
 
 void drawUsageRing() {
-    float fillRatio = (float)windowTokens / PLAN_TOKEN_LIMIT;
+    float fillRatio = (usagePct >= 0) ? usagePct / 100.0f : 0.0f;
     if (fillRatio > 1.0f) fillRatio = 1.0f;
 
     uint16_t ringColor;
@@ -530,22 +530,27 @@ void drawStatus() {
 
     // Top: countdown to plan window reset
     {
-        unsigned long startMs = (windowStartMs > 0) ? windowStartMs : (sessionStartMs > 0) ? sessionStartMs : bootMs;
-        unsigned long elapsedSec = (millis() - startMs) / 1000;
-        long remainSec = SESSION_WINDOW_SEC - (long)elapsedSec;
-        if (remainSec < 0) remainSec = 0;
-
-        int h = remainSec / 3600;
-        int m = (remainSec % 3600) / 60;
-        int s = remainSec % 60;
-
-        char timeBuf[16];
-        snprintf(timeBuf, sizeof(timeBuf), "%d:%02d:%02d", h, m, s);
         canvas.setTextDatum(TC_DATUM);
-        uint16_t timeColor = (remainSec < 600) ? C_ERR : (remainSec < 1800) ? C_WARN : C_LABEL;
-        canvas.setTextColor(timeColor, C_BG);
         canvas.setTextFont(2);
-        canvas.drawString(timeBuf, CX, 40);
+        if (planResetsAt > 0 && clockValid()) {
+            time_t now;
+            time(&now);
+            long remainSec = (long)(planResetsAt - now);
+            if (remainSec < 0) remainSec = 0;
+
+            int h = remainSec / 3600;
+            int m = (remainSec % 3600) / 60;
+            int s = remainSec % 60;
+            char timeBuf[16];
+            snprintf(timeBuf, sizeof(timeBuf), "%d:%02d:%02d", h, m, s);
+            uint16_t timeColor = (remainSec < 600) ? C_ERR : (remainSec < 1800) ? C_WARN : C_LABEL;
+            canvas.setTextColor(timeColor, C_BG);
+            canvas.drawString(timeBuf, CX, 40);
+        } else {
+            // No active window known (fresh boot or just reset)
+            canvas.setTextColor(C_GOOD, C_BG);
+            canvas.drawString("READY", CX, 40);
+        }
     }
 
     // Activity name at bottom
@@ -604,58 +609,25 @@ Activity toolToActivity(const char* tool) {
     return ACT_IDLE;
 }
 
+void applyUsageFields(JsonDocument& doc) {
+    // utilization: 0-100 percent straight from claude.ai (via Pi sync)
+    if (doc.containsKey("utilization")) {
+        float u = doc["utilization"] | -1.0f;
+        if (u >= 0) usagePct = u;
+    }
+    // reset_at: absolute epoch — no drift no matter how it's relayed
+    double ra = doc["reset_at"] | 0.0;
+    if (ra > 1700000000) planResetsAt = (time_t)ra;
+}
+
 void processJson(const char* json) {
     StaticJsonDocument<384> doc;
     if (deserializeJson(doc, json)) return;
 
-    // Check if 5h window expired — reset everything
-    if (windowStartMs > 0) {
-        unsigned long windowElapsed = (millis() - windowStartMs) / 1000;
-        if (windowElapsed >= SESSION_WINDOW_SEC) {
-            windowStartMs = 0;
-            windowTokens = 0;
-            prevSessionTokens = 0;
-            sessionTokens = 0;
-        }
-    }
-
-    // Track session
     const char* sess = doc["session"] | (const char*)nullptr;
-    if (sess && strcmp(sess, sessionId) != 0) {
-        // New session — save previous session's tokens to accumulator
-        prevSessionTokens += sessionTokens;
-        strlcpy(sessionId, sess, sizeof(sessionId));
-        sessionStartMs = millis();
-        sessionEvents = 0;
-        sessionTokens = 0;
-        // Start the window on first-ever session
-        if (windowStartMs == 0) windowStartMs = millis();
-    }
-    sessionEvents++;
+    if (sess) strlcpy(sessionId, sess, sizeof(sessionId));
 
-    // Update token count from hook (this session's transcript-based estimate)
-    unsigned long tokens = doc["tokens"] | 0UL;
-    if (tokens > 0) sessionTokens = tokens;
-
-    // Accumulated total for usage ring
-    windowTokens = prevSessionTokens + sessionTokens;
-
-    // Direct calibration overrides from claude.ai/settings/usage
-    long planTokens = doc["plan_tokens"] | -1L;
-    if (planTokens >= 0) windowTokens = (unsigned long)planTokens;
-
-    long planReset = doc["plan_reset"] | -1L;
-    if (planReset >= 0) {
-        // Set windowStartMs so countdown = planReset seconds remaining
-        windowStartMs = millis() - (unsigned long)(SESSION_WINDOW_SEC - planReset) * 1000;
-    }
-
-    // Timer offset correction (seconds already elapsed before first event)
-    long offset = doc["offset"] | 0L;
-    if (offset > 0 && windowStartMs > 0) {
-        unsigned long adjusted = millis() - (unsigned long)(offset * 1000);
-        if (adjusted < windowStartMs) windowStartMs = adjusted;
-    }
+    applyUsageFields(doc);
 
     const char* tool = doc["tool"] | (const char*)nullptr;
     const char* activity = doc["activity"] | (const char*)nullptr;
@@ -734,14 +706,15 @@ void handleOptions() {
 void handleStatus() {
     sendCors();
     long remainSec = 0;
-    unsigned long startMs = (windowStartMs > 0) ? windowStartMs : (sessionStartMs > 0) ? sessionStartMs : bootMs;
-    unsigned long elapsed = (millis() - startMs) / 1000;
-    remainSec = SESSION_WINDOW_SEC - (long)elapsed;
-    if (remainSec < 0) remainSec = 0;
+    if (planResetsAt > 0 && clockValid()) {
+        time_t now; time(&now);
+        remainSec = (long)(planResetsAt - now);
+        if (remainSec < 0) remainSec = 0;
+    }
     char buf[256];
     snprintf(buf, sizeof(buf),
-        "{\"activity\":\"%s\",\"events\":%d,\"tokens\":%lu,\"remain\":%ld,\"uptime\":%lu}",
-        activityNames[currentActivity], eventCount, windowTokens, remainSec, millis() / 1000);
+        "{\"activity\":\"%s\",\"events\":%d,\"usage\":%.1f,\"remain\":%ld,\"uptime\":%lu}",
+        activityNames[currentActivity], eventCount, usagePct, remainSec, millis() / 1000);
     server.send(200, "application/json", buf);
 }
 
@@ -780,6 +753,8 @@ void setupWiFi() {
         wifiConnected = true;
         Serial.printf("\nWiFi: connected to %s IP: %s\n",
             WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+        configTime(9 * 3600, 0, "ntp.nict.jp", "pool.ntp.org");
+        Serial.println("NTP sync started");
         startHttpServer();
     } else {
         Serial.println("\nWiFi: connection failed");
@@ -836,20 +811,41 @@ void setup() {
                    String(wifiConnected ? "true" : "false") + "}");
 }
 
+double lastRelayTimestamp = 0;
+
 void pollRelay() {
     if (!wifiConnected) return;
     if (millis() - lastPoll < POLL_INTERVAL) return;
     lastPoll = millis();
 
     WiFiClientSecure client;
-    client.setInsecure();  // skip cert verification for speed
+    client.setInsecure();
     HTTPClient http;
     http.setTimeout(2000);
     if (!http.begin(client, RELAY_URL)) return;
     int code = http.GET();
     if (code == 200) {
         String body = http.getString();
-        processJson(body.c_str());
+        StaticJsonDocument<512> doc;
+        if (!deserializeJson(doc, body)) {
+            double ts = doc["updated_at"] | 0.0;
+            int age = doc["age"] | -1;
+            bool isNew = (ts > 0 && ts != lastRelayTimestamp);
+            if (isNew) {
+                lastRelayTimestamp = ts;
+                if (age >= 0 && age < 15) {
+                    const char* tool = doc["tool"] | (const char*)nullptr;
+                    if (tool && tool[0]) {
+                        strlcpy(lastTool, tool, sizeof(lastTool));
+                        setActivity(toolToActivity(tool));
+                        lastEventTime = millis();
+                        eventCount++;
+                    }
+                }
+            }
+            // Usage fields applied on every poll (absolute values, no drift)
+            applyUsageFields(doc);
+        }
     }
     http.end();
 }
@@ -858,6 +854,16 @@ void loop() {
     readSerial();
     if (wifiConnected) server.handleClient();
     pollRelay();
+
+    // Plan window rollover: when reset time passes, clear → "READY" until next sync
+    if (planResetsAt > 0 && clockValid()) {
+        time_t now;
+        time(&now);
+        if (now >= planResetsAt) {
+            planResetsAt = 0;
+            usagePct = -1.0f;
+        }
+    }
 
     // Auto-idle → sleep progression
     if (lastEventTime > 0 && currentActivity != ACT_DISCONNECTED) {
