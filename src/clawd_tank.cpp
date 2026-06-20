@@ -6,6 +6,7 @@
 #include <WebServer.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <CST816S.h>
 
 // ============================================================
 // Clawd Tank — Pixel Art Crab for ESP32-C3 + GC9A01 (240x240)
@@ -38,6 +39,7 @@ TFT_eSprite canvas = TFT_eSprite(&tft);
 #define C_FLASH     0xFFE0  // bright
 #define C_LABEL     0x8C71  // gray text
 #define C_INACTIVE  0x4208  // dim
+#define C_PINK      0xFCD4  // blush / hearts (petting reaction)
 
 // --- Screen ---
 #define SW 240
@@ -112,6 +114,18 @@ unsigned long lastKeepalive = 0;
 #define RELAY_URL "https://crab.robostadion.com/state"
 unsigned long lastPoll = 0;
 #define POLL_INTERVAL 3000  // 3 seconds
+
+// --- Touch (CST816S capacitive, I2C) ---
+CST816S touch(4, 5, 1, 0);   // SDA=4, SCL=5, RST=1, INT=0 (Waveshare 1.28 round)
+bool touchInited = false;
+float eyeLookX = 0, eyeLookY = 0;     // smoothed eye offset toward finger (grid units)
+float eyeTargetX = 0, eyeTargetY = 0; // raw target from latest touch
+unsigned long lastTouchMs = 0;
+unsigned long petReactUntil = 0;      // happy "petted" reaction active until this millis()
+int lastTouchX = -1;
+int lastStrokeDir = 0;
+int strokeCount = 0;
+unsigned long lastStrokeMs = 0;
 
 // --- Animation ---
 float phase = 0;
@@ -189,6 +203,12 @@ void drawSparkles() {
 
 void drawPixelBlock(int gx, int gy, int gw, int gh, uint16_t color, int ox, int oy) {
     canvas.fillRect(ox + gx * PX, oy + gy * PX, gw * PX, gh * PX, color);
+}
+
+void drawHeart(int cx, int cy, int s, uint16_t c) {
+    canvas.fillCircle(cx - s / 2, cy, s / 2 + 1, c);
+    canvas.fillCircle(cx + s / 2, cy, s / 2 + 1, c);
+    canvas.fillTriangle(cx - s, cy, cx + s, cy, cx, cy + s + s / 2, c);
 }
 
 void drawClawd(int ox, int oy, float ph) {
@@ -279,6 +299,16 @@ void drawClawd(int ox, int oy, float ph) {
         }
     }
 
+    // --- Touch: eyes follow finger; petting triggers a happy reaction ---
+    bool petting = (millis() < petReactUntil);
+    if (petting) {
+        eyeOx = 0;
+        eyeOy = 0;
+    } else {
+        eyeOx += (int)roundf(eyeLookX);
+        eyeOy += (int)roundf(eyeLookY);
+    }
+
     int by = oy + bobY;
 
     // --- Shadow (row 15) ---
@@ -341,7 +371,17 @@ void drawClawd(int ox, int oy, float ph) {
     }
 
     // --- Eyes ---
-    if (currentActivity == ACT_ERROR) {
+    if (petting) {
+        // Happy squint (^ ^) + blush cheeks while being petted
+        int ey = by + 9 * PX;
+        for (int i = 0; i < 3; i++) {
+            int dy = (i == 1) ? 0 : 1;
+            canvas.fillRect(ox + (3 + i) * PX, ey + dy * PX / 3, PX, PX / 4, C_EYE);
+            canvas.fillRect(ox + (9 + i) * PX, ey + dy * PX / 3, PX, PX / 4, C_EYE);
+        }
+        canvas.fillRoundRect(ox + 2 * PX + PX / 4, by + 9 * PX + PX / 2, PX + PX / 2, PX / 2 + 2, 2, C_PINK);
+        canvas.fillRoundRect(ox + 11 * PX, by + 9 * PX + PX / 2, PX + PX / 2, PX / 2 + 2, 2, C_PINK);
+    } else if (currentActivity == ACT_ERROR) {
         // X-shaped eyes (dizzy/KO)
         int ex1 = ox + 4 * PX, ex2 = ox + 10 * PX, ey = by + 8 * PX;
         canvas.drawLine(ex1, ey, ex1 + PX, ey + PX*2, C_EYE);
@@ -372,7 +412,8 @@ void drawClawd(int ox, int oy, float ph) {
         drawPixelBlock(10 + eyeOx, 8 + eyeOy, 1, 2, C_EYE, ox, by);
     }
 
-    // --- Mouth & Effects ---
+    // --- Mouth & Effects (suppressed while being petted) ---
+    if (!petting) {
     if (currentActivity == ACT_BASH || currentActivity == ACT_MCP) {
         // Open mouth
         canvas.fillRect(ox + 7 * PX, by + 11 * PX, PX, PX/2, C_EYE);
@@ -443,6 +484,22 @@ void drawClawd(int ox, int oy, float ph) {
         // Reading: small book under crab
         canvas.fillRect(ox + 5 * PX, by + 13 * PX + PX/2, PX * 5, PX/3, C_ACCENT);
         canvas.drawFastVLine(ox + 7 * PX + PX/2, by + 13 * PX + PX/2, PX/3, C_BG);
+    }
+    } // end !petting
+
+    // --- Petting reaction: smile + floating hearts ---
+    if (petting) {
+        canvas.fillRect(ox + 6 * PX, by + 11 * PX, PX * 3, PX / 3, C_EYE);
+        canvas.fillRect(ox + 5 * PX + PX / 2, by + 11 * PX + PX / 4, PX / 2, PX / 4, C_EYE);
+        canvas.fillRect(ox + 9 * PX, by + 11 * PX + PX / 4, PX / 2, PX / 4, C_EYE);
+        for (int i = 0; i < 3; i++) {
+            float hp = phase * 0.9f + i * 2.1f;
+            float yy = fmodf(hp, 5.0f);
+            if (yy > 4.0f) continue;
+            int hx = ox + (3 + i * 4) * PX + PX / 2;
+            int hy = by + (int)((4 - yy) * PX);
+            drawHeart(hx, hy, PX / 2 + 1, C_PINK);
+        }
     }
 }
 
@@ -778,6 +835,9 @@ void setup() {
     pinMode(3, OUTPUT);
     digitalWrite(3, HIGH);
 
+    touch.begin();
+    touchInited = true;
+
     initColors();
     canvas.createSprite(SW, SH);
     memset(sparkles, 0, sizeof(sparkles));
@@ -850,8 +910,66 @@ void pollRelay() {
     http.end();
 }
 
+// ============================================================
+//  Touch handling (CST816S) — eyes follow finger, petting reaction
+// ============================================================
+
+void updateTouch() {
+    if (!touchInited) return;
+
+    if (touch.available()) {
+        int tx = touch.data.x;
+        int ty = touch.data.y;
+        lastTouchMs = millis();
+        lastEventTime = millis();              // touch counts as activity (wakes from sleep)
+        if (currentActivity == ACT_SLEEPING) currentActivity = ACT_IDLE;
+
+        // Eyes look toward the finger: map screen point to a grid-unit offset
+        float dx = (tx - CX) / (float)CX;                 // -1..1
+        float faceY = (SH / 2 - 20) + 9 * PX;             // approx eye row on screen
+        float dy = (ty - faceY) / (float)CX;
+        if (dx > 1) dx = 1; if (dx < -1) dx = -1;
+        if (dy > 1) dy = 1; if (dy < -1) dy = -1;
+        eyeTargetX = dx * 2.0f;
+        eyeTargetY = dy * 2.0f;
+
+        // Petting: count horizontal back-and-forth strokes
+        if (lastTouchX >= 0) {
+            int ddx = tx - lastTouchX;
+            if (abs(ddx) > 8) {
+                int dir = (ddx > 0) ? 1 : -1;
+                if (lastStrokeDir != 0 && dir != lastStrokeDir) {
+                    strokeCount++;
+                    lastStrokeMs = millis();
+                }
+                lastStrokeDir = dir;
+            }
+        }
+        lastTouchX = tx;
+        if (strokeCount >= 3) {
+            petReactUntil = millis() + 2500;
+            strokeCount = 0;
+            for (int i = 0; i < 4; i++) spawnSparkle(C_PINK);
+        }
+    }
+
+    // Finger lifted (no events briefly): relax eyes, reset stroke tracking
+    if (millis() - lastTouchMs > 250) {
+        eyeTargetX = 0;
+        eyeTargetY = 0;
+        lastTouchX = -1;
+        lastStrokeDir = 0;
+    }
+    if (millis() - lastStrokeMs > 1200) strokeCount = 0;
+
+    // Smoothly ease the eyes toward the target (cute glide)
+    eyeLookX += (eyeTargetX - eyeLookX) * 0.25f;
+    eyeLookY += (eyeTargetY - eyeLookY) * 0.25f;
+}
+
 void loop() {
     readSerial();
+    updateTouch();
     if (wifiConnected) server.handleClient();
     pollRelay();
 

@@ -61,20 +61,23 @@ def save_creds(oauth):
         json.dump(data, f)
 
 
+CLAUDE_BIN = "/home/pi/.local/bin/claude"
+
+
 def refresh_token(oauth):
-    log("refreshing access token...")
-    r = http_json(TOKEN_URL, data={
-        "grant_type": "refresh_token",
-        "refresh_token": oauth["refreshToken"],
-        "client_id": CLIENT_ID,
-    })
-    oauth["accessToken"] = r["access_token"]
-    if r.get("refresh_token"):
-        oauth["refreshToken"] = r["refresh_token"]
-    oauth["expiresAt"] = int((time.time() + r.get("expires_in", 3600)) * 1000)
-    save_creds(oauth)
-    log("token refreshed OK")
-    return oauth
+    # Our own curl refresh ALWAYS 429s (request differs from the official
+    # client somehow). The official CLI refreshes reliably, so let it do it:
+    # `claude -p ok` forces a refresh of ~/.claude/.credentials.json.
+    # Driven by the 60s sync loop, this self-heals with no multi-hour gap
+    # (unlike the old standalone 7h timer, which left the token expired if a
+    # single run failed).
+    log("refreshing token via claude CLI...")
+    subprocess.run([CLAUDE_BIN, "-p", "ok"], capture_output=True, timeout=90)
+    fresh = load_creds()  # re-read the token the CLI just wrote
+    if time.time() * 1000 > fresh.get("expiresAt", 0):
+        raise RuntimeError("CLI refresh did not produce a valid token")
+    log("token refreshed OK (via CLI)")
+    return fresh
 
 
 def get_usage(oauth):
@@ -95,8 +98,8 @@ def find_five_hour(usage):
 
 
 def sync_once(oauth):
-    # refresh 5 min before expiry
-    if time.time() * 1000 > oauth.get("expiresAt", 0) - 300000:
+    # refresh 15 min before expiry (margin so we never serve an expired token)
+    if time.time() * 1000 > oauth.get("expiresAt", 0) - 900000:
         oauth = refresh_token(oauth)
     try:
         usage = get_usage(oauth)
@@ -129,15 +132,27 @@ def sync_once(oauth):
     return oauth
 
 
+MAX_BACKOFF = 600  # 10 min ceiling — CLI refresh self-heals, no need to sleep for hours
+
 if __name__ == "__main__":
     oauth = load_creds()
+    backoff = INTERVAL
     while True:
         try:
             oauth = sync_once(oauth)
-        except Exception as e:
-            log(f"sync error: {e}")
+            backoff = INTERVAL  # success → resume normal cadence
+            time.sleep(INTERVAL)
+        except HttpError as e:
+            # Back off hard on rate limits so we never hammer the token
+            # endpoint into a sustained 429 (the failure that froze the badge).
+            log(f"sync error: {e}; backing off {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF)
             try:
-                oauth = load_creds()  # re-read in case claude CLI rotated tokens
+                oauth = load_creds()
             except Exception:
                 pass
-        time.sleep(INTERVAL)
+        except Exception as e:
+            log(f"sync error: {e}; backing off {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF)
