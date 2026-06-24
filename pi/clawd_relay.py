@@ -103,6 +103,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                 expire_if_needed()
                 payload = dict(STATE)
             payload["age"] = int(time.time() - payload["updated_at"]) if payload["updated_at"] else -1
+            # remain_sec: countdown computed with the Pi's authoritative clock,
+            # so the badge needs no working NTP of its own (-1 = unknown).
+            if payload["reset_at"] and payload["reset_at"] > 0:
+                payload["remain_sec"] = max(0, int(payload["reset_at"] - time.time()))
+            else:
+                payload["remain_sec"] = -1
             self._send(200, "application/json", json.dumps(payload))
         elif self.path == "/":
             self._send(200, "text/plain", "Clawd Relay OK")

@@ -100,10 +100,23 @@ char sessionId[20] = "";
 float usagePct = -1.0f;     // 0-100 from claude.ai utilization, -1 = unknown
 time_t planResetsAt = 0;    // absolute Unix epoch of 5h window reset, 0 = unknown
 
+// millis()-based countdown deadline, fed by the relay's remain_sec (computed
+// with the Pi's clock). This makes the countdown independent of the badge's
+// own NTP — if NTP never syncs, the timer still runs.
+unsigned long planDeadlineMs = 0;
+bool haveDeadline = false;
+
 bool clockValid() {
     time_t now;
     time(&now);
     return now > 1700000000;
+}
+
+// Seconds left until the window resets, or -1 if unknown.
+long planRemainSec() {
+    if (!haveDeadline) return -1;
+    long diffMs = (long)(planDeadlineMs - millis());
+    return diffMs > 0 ? diffMs / 1000 : 0;
 }
 
 // --- Battery keepalive ---
@@ -589,12 +602,8 @@ void drawStatus() {
     {
         canvas.setTextDatum(TC_DATUM);
         canvas.setTextFont(2);
-        if (planResetsAt > 0 && clockValid()) {
-            time_t now;
-            time(&now);
-            long remainSec = (long)(planResetsAt - now);
-            if (remainSec < 0) remainSec = 0;
-
+        long remainSec = planRemainSec();
+        if (remainSec >= 0) {
             int h = remainSec / 3600;
             int m = (remainSec % 3600) / 60;
             int s = remainSec % 60;
@@ -672,9 +681,23 @@ void applyUsageFields(JsonDocument& doc) {
         float u = doc["utilization"] | -1.0f;
         if (u >= 0) usagePct = u;
     }
-    // reset_at: absolute epoch — no drift no matter how it's relayed
+    // reset_at: absolute epoch — kept for reference / NTP-based displays
     double ra = doc["reset_at"] | 0.0;
     if (ra > 1700000000) planResetsAt = (time_t)ra;
+
+    // remain_sec: Pi-computed countdown — the primary, NTP-independent source.
+    // >0 sets a fresh millis() deadline each poll (no drift accumulation);
+    // 0 or -1 means the window reset or is unknown.
+    if (doc.containsKey("remain_sec")) {
+        long rs = doc["remain_sec"] | -1L;
+        if (rs > 0) {
+            planDeadlineMs = millis() + (unsigned long)rs * 1000UL;
+            haveDeadline = true;
+        } else {
+            haveDeadline = false;
+            if (rs == 0) usagePct = -1.0f;  // window just rolled over
+        }
+    }
 }
 
 void processJson(const char* json) {
@@ -762,12 +785,8 @@ void handleOptions() {
 
 void handleStatus() {
     sendCors();
-    long remainSec = 0;
-    if (planResetsAt > 0 && clockValid()) {
-        time_t now; time(&now);
-        remainSec = (long)(planResetsAt - now);
-        if (remainSec < 0) remainSec = 0;
-    }
+    long remainSec = planRemainSec();
+    if (remainSec < 0) remainSec = 0;
     char buf[256];
     snprintf(buf, sizeof(buf),
         "{\"activity\":\"%s\",\"events\":%d,\"usage\":%.1f,\"remain\":%ld,\"uptime\":%lu}",
@@ -973,14 +992,10 @@ void loop() {
     if (wifiConnected) server.handleClient();
     pollRelay();
 
-    // Plan window rollover: when reset time passes, clear → "READY" until next sync
-    if (planResetsAt > 0 && clockValid()) {
-        time_t now;
-        time(&now);
-        if (now >= planResetsAt) {
-            planResetsAt = 0;
-            usagePct = -1.0f;
-        }
+    // Plan window rollover: deadline passed → clear → "READY" until next sync
+    if (haveDeadline && (long)(planDeadlineMs - millis()) <= 0) {
+        haveDeadline = false;
+        usagePct = -1.0f;
     }
 
     // Auto-idle → sleep progression
